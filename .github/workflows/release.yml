@@ -32,6 +32,14 @@ jobs:
           mkdir -p dist
           go build -o dist/sflashy-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/sflashy
 
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+
       - name: Upload binaries
         uses: softprops/action-gh-release@v2
         with:
