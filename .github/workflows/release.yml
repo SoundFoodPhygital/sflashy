@@ -83,7 +83,7 @@ jobs:
         with:
           # Il nome del tag viene preso automaticamente dall'evento che ha triggerato il workflow
           tag_name: ${{ github.ref_name }}
-          name: Release ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
           draft: false
           prerelease: false
           # Carica tutti i file da tutte le sottocartelle di 'artifacts'
