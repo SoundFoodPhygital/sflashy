@@ -2,10 +2,10 @@
 // author: Gemini (re-implementation of script by Matteo Spanio)
 // date: 2025-06-19
 // license: GPL3
-
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"log"
@@ -15,7 +15,7 @@ import (
 	"github.com/jaypipes/ghw"
 )
 
-// ANSI color codes for better output
+// (I codici colore e le altre funzioni come usage() e listBlockDevices() rimangono invariate)
 const (
 	ColorRed    = "\033[31m"
 	ColorGreen  = "\033[32m"
@@ -52,78 +52,61 @@ func listBlockDevices() {
 	}
 }
 
-// progressWriter is a helper to show progress during the copy operation.
-// It implements the io.Writer interface.
+// progressWriter rimane invariato
 type progressWriter struct {
 	total     int64
+	out       io.Writer // Scriviamo il progresso su un output generico
 	lastShown int64
 }
 
-// Write implements the io.Writer interface.
-// It is called by io.Copy for each chunk of data written.
 func (pw *progressWriter) Write(p []byte) (int, error) {
 	n := len(p)
 	pw.total += int64(n)
-
-	// Update progress every 2MB to avoid flooding the console
 	if pw.total-pw.lastShown > 2*1024*1024 {
-		// Carriage return '\r' moves the cursor to the beginning of the line
-		fmt.Printf("\r%sWriting... %.2f GB copied%s", ColorYellow, float64(pw.total)/(1024*1024*1024), ColorReset)
+		// Scrive il progresso sull'output specificato (es. os.Stdout)
+		fmt.Fprintf(pw.out, "\r%sWriting... %.2f GB copied%s", ColorYellow, float64(pw.total)/(1024*1024*1024), ColorReset)
 		pw.lastShown = pw.total
 	}
-
 	return n, nil
 }
 
-// flashDevice writes the image file to the specified device.
-// It replaces the 'dd' command.
-func flashDevice(imagePath, devicePath string) error {
-	// Open the source image file
-	source, err := os.Open(imagePath)
-	if err != nil {
-		return fmt.Errorf("could not open image file %s: %w", imagePath, err)
-	}
-	defer source.Close()
+// flashDevice ora accetta interfacce, rendendola testabile.
+// source: Lo stream di dati dell'immagine.
+// dest: Lo stream di dati del dispositivo di destinazione.
+// userInput: Lo stream per leggere l'input dell'utente (la conferma 'y/N').
+// termOut: Lo stream per scrivere i messaggi all'utente.
+func flashDevice(source io.Reader, dest io.Writer, userInput io.Reader, termOut io.Writer) error {
+	fmt.Fprintln(termOut, "Flashing image to device. This will erase all data on the device.")
+	fmt.Fprint(termOut, "Are you sure? [y/N]: ")
 
-	// Open the destination device for writing.
-	// Use os.O_WRONLY for write-only and os.O_EXCL to ensure it's not a directory.
-	dest, err := os.OpenFile(devicePath, os.O_WRONLY|os.O_EXCL, 0666)
-	if err != nil {
-		return fmt.Errorf("could not open device %s for writing: %w", devicePath, err)
-	}
-	defer dest.Close()
+	reader := bufio.NewReader(userInput)
+	response, _ := reader.ReadString('\n')
+	response = strings.TrimSpace(response)
 
-	fmt.Printf("Flashing %s to %s. This will erase all data on the device.\n", imagePath, devicePath)
-	fmt.Print("Are you sure? [y/N]: ")
-	var response string
-	fmt.Scanln(&response)
 	if response != "y" && response != "Y" {
-		fmt.Println("Operation cancelled.")
-		return nil // Not an error, user cancelled
+		fmt.Fprintln(termOut, "Operation cancelled.")
+		return nil
 	}
 
-	fmt.Println("Starting flash operation...")
+	fmt.Fprintln(termOut, "Starting flash operation...")
 
-	// Create a progress writer and a TeeReader to write to both the device and the progress writer
-	pw := &progressWriter{}
+	pw := &progressWriter{out: termOut}
 	readerWithProgress := io.TeeReader(source, pw)
 
-	// io.Copy does the heavy lifting of reading from source and writing to dest.
-	// It uses an internal buffer, which is efficient.
-	_, err = io.Copy(dest, readerWithProgress)
+	// Usiamo io.CopyBuffer per un maggiore controllo e potenziale efficienza
+	buf := make([]byte, 32*1024*1024) // Buffer da 32MB come in dd bs=32M
+	_, err := io.CopyBuffer(dest, readerWithProgress, buf)
+
 	if err != nil {
-		return fmt.Errorf("\nerror while writing to device: %w", err)
+		fmt.Fprintln(termOut) // Nuova riga per non sovrascrivere il progresso
+		return fmt.Errorf("error while writing to device: %w", err)
 	}
 
-	// This is the equivalent of dd's conv=fsync.
-	// It ensures all buffered data is written to the underlying device.
-	fmt.Println("\nFinalizing write (syncing)...")
-	err = dest.Sync()
-	if err != nil {
-		return fmt.Errorf("failed to sync data to device: %w", err)
-	}
+	// La chiamata a Sync() deve essere fatta sul file reale, non sull'interfaccia.
+	// La gestiamo nel chiamante (la funzione main).
 
-	fmt.Println(ColorGreen + "\nFlash completed successfully!" + ColorReset)
+	fmt.Fprintln(termOut) // Nuova riga finale
+	fmt.Fprintln(termOut, ColorGreen+"\nFlash completed successfully!"+ColorReset)
 	return nil
 }
 
@@ -150,7 +133,7 @@ func main() {
 	}
 
 	imageFile := args[1]
-	device := args[2]
+	devicePath := args[2]
 
 	// Check if the image file exists and is a regular file
 	info, err := os.Stat(imageFile)
@@ -162,18 +145,40 @@ func main() {
 	}
 
 	// Check if the device exists and is a block device
-	info, err = os.Stat(device)
+	info, err = os.Stat(devicePath)
 	if os.IsNotExist(err) {
-		log.Fatalf(ColorRed+"Error: Device not found: %s"+ColorReset, device)
+		log.Fatalf(ColorRed+"Error: Device not found: %s"+ColorReset, devicePath)
 	}
 	// os.ModeDevice indicates it's a device file (/dev/...).
 	// We check that this bit is set in the file mode.
 	if (info.Mode() & os.ModeDevice) == 0 {
-		log.Fatalf(ColorRed+"Error: The provided path is not a block device: %s"+ColorReset, device)
+		log.Fatalf(ColorRed+"Error: The provided path is not a block device: %s"+ColorReset, devicePath)
 	}
 
-	// --- Execute the core logic ---
-	if err := flashDevice(imageFile, device); err != nil {
+	// --- Logica di esecuzione ---
+
+	// Apriamo i file/device reali qui
+	source, err := os.Open(imageFile)
+	if err != nil {
+		log.Fatalf(ColorRed+"Error: Could not open image file %s: %v"+ColorReset, imageFile, err)
+	}
+	defer source.Close()
+
+	dest, err := os.OpenFile(devicePath, os.O_WRONLY|os.O_EXCL, 0666)
+	if err != nil {
+		log.Fatalf(ColorRed+"Error: Could not open device %s for writing: %v"+ColorReset, devicePath, err)
+	}
+	defer dest.Close()
+
+	// Eseguiamo la logica passando gli stream reali
+	err = flashDevice(source, dest, os.Stdin, os.Stdout)
+	if err != nil {
 		log.Fatalf(ColorRed+"\nAn error occurred: %v"+ColorReset, err)
+	}
+
+	// Eseguiamo Sync sul file descriptor reale dopo che flashDevice ha terminato
+	fmt.Println("Finalizing write (syncing)...")
+	if err := dest.Sync(); err != nil {
+		log.Fatalf(ColorRed+"Failed to sync data to device: %v"+ColorReset, err)
 	}
 }
