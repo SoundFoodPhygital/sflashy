@@ -3,17 +3,25 @@ name: Build and Release
 on:
   push:
     tags:
-      - 'v*'  # trigger solo quando pusha un tag come v1.0.0
+      - 'v*' # trigger solo quando pusha un tag come v1.0.0
 
 jobs:
   build:
-    name: Build binaries
+    name: Build and Release
     runs-on: ubuntu-latest
+
+    # AGGIUNGI QUESTO BLOCCO DI PERMESSI
+    permissions:
+      contents: write # Permesso necessario per creare release e caricare artefatti
 
     strategy:
       matrix:
         goos: [linux, windows, darwin]
         goarch: [amd64, arm64]
+        # Escludi combinazioni non comuni o non supportate se necessario
+        # exclude:
+        #   - goos: darwin
+        #     goarch: arm64 # Se non vuoi il binario per Mac M1/M2
 
     steps:
       - name: Checkout code
@@ -25,24 +33,61 @@ jobs:
           go-version: '1.23'
 
       - name: Build
+        id: build_binaries # Aggiungi un id a questo step
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
-          mkdir -p dist
-          go build -o dist/sflashy-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/sflashy
+          # Definisci il nome del binario, aggiungendo .exe per Windows
+          BINARY_NAME="sflashy-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            BINARY_NAME+=".exe"
+          fi
 
-      - name: Create GitHub Release
+          # Crea la directory di output
+          mkdir -p dist
+
+          # Compila il binario
+          go build -o dist/${BINARY_NAME} ./cmd/sflashy
+
+          # Salva il percorso del binario in un output dello step
+          echo "path=dist/${BINARY_NAME}" >> $GITHUB_OUTPUT
+
+      # Questo step carica gli artefatti costruiti dalla matrice
+      # in modo che siano disponibili per lo step di release successivo.
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sflashy-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ${{ steps.build_binaries.outputs.path }}
+
+  # Aggiungi un nuovo job che dipende dal job di build
+  # e che viene eseguito solo una volta.
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: build # Questo job partirà solo dopo che tutti i build della matrice saranno completati
+
+    # AGGIUNGI I PERMESSI ANCHE QUI
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts # Scarica tutti gli artefatti in una cartella 'artifacts'
+
+      - name: Create GitHub Release and Upload Binaries
         uses: softprops/action-gh-release@v2
         with:
+          # Il nome del tag viene preso automaticamente dall'evento che ha triggerato il workflow
           tag_name: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
           draft: false
           prerelease: false
-
-      - name: Upload binaries
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
+          # Carica tutti i file da tutte le sottocartelle di 'artifacts'
+          files: artifacts/**/*
         env:
+          # Il token è necessario per l'autenticazione
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
